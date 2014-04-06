@@ -120,6 +120,10 @@ static int history_max_len = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
 static int history_len = 0;
 static char **history = NULL;
 
+static char *search_save = NULL;   /* Temporary: Buffer before search */
+static int search_pos = -1; /* The current search position in history */
+
+
 /* The linenoiseState structure represents the state during line editing.
  * We pass this state to functions implementing specific editing
  * functionalities. */
@@ -146,6 +150,7 @@ enum KEY_ACTION{
 	CTRL_D = 4,         /* Ctrl-d */
 	CTRL_E = 5,         /* Ctrl-e */
 	CTRL_F = 6,         /* Ctrl-f */
+	CTRL_G = 7,         /* Ctrl-g */
 	CTRL_H = 8,         /* Ctrl-h */
 	TAB = 9,            /* Tab */
 	CTRL_K = 11,        /* Ctrl+k */
@@ -153,6 +158,7 @@ enum KEY_ACTION{
 	ENTER = 13,         /* Enter */
 	CTRL_N = 14,        /* Ctrl-n */
 	CTRL_P = 16,        /* Ctrl-p */
+	CTRL_R = 18,        /* Ctrl-r */
 	CTRL_T = 20,        /* Ctrl-t */
 	CTRL_U = 21,        /* Ctrl+u */
 	CTRL_W = 23,        /* Ctrl+w */
@@ -459,7 +465,7 @@ static void refreshSingleLine(struct linenoiseState *l) {
     size_t len = l->len;
     size_t pos = l->pos;
     struct abuf ab;
-    
+
     while((plen+pos) >= l->cols) {
         buf++;
         len--;
@@ -470,18 +476,60 @@ static void refreshSingleLine(struct linenoiseState *l) {
     }
 
     abInit(&ab);
-    /* Cursor to left edge */
-    snprintf(seq,64,"\x1b[0G");
-    abAppend(&ab,seq,strlen(seq));
+
+    /* If in search mode, prompt takes two lines */
+    if (search_save != NULL) {
+	    if (l->maxrows == 0) {
+		    /* Cursor to left edge */
+		    snprintf(seq,64,"\x1b[0G");
+		    abAppend(&ab,seq,strlen(seq));
+		    l->maxrows = 1;
+	    } else {
+		    snprintf(seq,64,"\x1b[%dB", 1);
+		    abAppend(&ab,seq,strlen(seq));
+		    snprintf(seq,64,"\x1b[0G\x1b[0K\x1b[1A");
+		    abAppend(&ab,seq,strlen(seq));
+		    snprintf(seq,64,"\x1b[0G\x1b[0K");
+		    abAppend(&ab,seq,strlen(seq));
+	    }
+    } else {
+	    if (l->maxrows == 1) {
+		    snprintf(seq,64,"\x1b[%dB", 1);
+		    abAppend(&ab,seq,strlen(seq));
+		    snprintf(seq,64,"\x1b[0G\x1b[0K\x1b[1A");
+		    abAppend(&ab,seq,strlen(seq));
+		    snprintf(seq,64,"\x1b[0G\x1b[0K");
+		    abAppend(&ab,seq,strlen(seq));
+	    } else {
+		    /* Cursor to left edge */
+		    snprintf(seq,64,"\x1b[0G");
+		    abAppend(&ab,seq,strlen(seq));
+	    }
+	    l->maxrows = 0;
+    }
+
     /* Write the prompt and the current buffer content */
     abAppend(&ab,l->prompt,strlen(l->prompt));
-    abAppend(&ab,buf,len);
+
+    if (search_save == NULL) {
+	    abAppend(&ab,buf,len);
+    } else if (search_pos >= 0 && search_pos < history_len) {
+	    abAppend(&ab,history[search_pos],strlen(history[search_pos]));
+    }
+
     /* Erase to right */
     snprintf(seq,64,"\x1b[0K");
     abAppend(&ab,seq,strlen(seq));
     /* Move cursor to original position. */
     snprintf(seq,64,"\x1b[0G\x1b[%dC", (int)(pos+plen));
     abAppend(&ab,seq,strlen(seq));
+
+    /* if in search mode, show search prompt */
+    if (search_save != NULL) {
+	    snprintf(seq, 64, "\n\x1b[0Gbck-i-search: %s", l->buf);
+	    abAppend(&ab, seq, strlen(seq));
+    }
+
     if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
 }
@@ -661,6 +709,63 @@ void linenoiseEditHistoryNext(struct linenoiseState *l, int dir) {
     }
 }
 
+/* Search using ctrl+r in history */
+void linenoiseEditHistorySearch(struct linenoiseState *l) {
+    int i;
+
+    if (search_save == NULL) {
+        search_save = strdup(l->buf);
+        l->buf[0] = '\0';
+        l->len = l->pos = 0;
+    }
+
+    if (l->buf[0] == '\0') {
+	    goto fail;
+    }
+
+    if (search_pos >= (history_len - 1))
+        i = 0;
+    else
+	    i = search_pos + 1;
+    for (; i < history_len; ++i) {
+        if (strstr(history[i], l->buf) != NULL) {
+            search_pos = i;
+            return;
+        }
+    }
+fail:
+    search_pos = -1;
+    return;
+}
+
+/* Complete history search, drop temporary state */
+void linenoiseEditHistorySearchComplete(struct linenoiseState *l) {
+    if (search_save != NULL) {
+        free(search_save);
+        search_save = NULL;
+    }
+    if (search_pos >= 0 && search_pos < history_len) {
+	    strncpy(l->buf, history[search_pos], l->buflen);
+	    l->buf[l->buflen-1] = '\0';
+	    l->len = l->pos = strlen(l->buf);
+	    refreshLine(l);
+    }
+    search_pos = -1;
+}
+
+/* Cancel history search, restore buffer */
+void linenoiseEditHistorySearchCancel(struct linenoiseState *l) {
+    if (search_save != NULL) {
+        strncpy(l->buf, search_save, l->buflen);
+        l->buf[l->buflen-1] = '\0';
+        l->len = l->pos = strlen(l->buf);
+        free(search_save);
+        search_save = NULL;
+    }
+    search_pos = -1;
+    refreshLine(l);
+}
+
 /* Delete the character at the right of the cursor without altering the cursor
  * position. Basically this is what happens with the "Delete" keyboard key. */
 void linenoiseEditDelete(struct linenoiseState *l) {
@@ -753,6 +858,10 @@ static int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, 
             if (c == 0) continue;
         }
 
+        if (c != CTRL_R && c != CTRL_G && !isgraph(c) && c != BACKSPACE) {
+            linenoiseEditHistorySearchComplete(&l);
+        }
+
         switch(c) {
         case ENTER:    /* enter */
             history_len--;
@@ -792,6 +901,13 @@ static int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, 
             break;
         case CTRL_P:    /* ctrl-p */
             linenoiseEditHistoryNext(&l, LINENOISE_HISTORY_PREV);
+            break;
+        case CTRL_R:
+            linenoiseEditHistorySearch(&l);
+            refreshLine(&l);
+            break;
+        case CTRL_G:
+            linenoiseEditHistorySearchCancel(&l);
             break;
         case CTRL_N:    /* ctrl-n */
             linenoiseEditHistoryNext(&l, LINENOISE_HISTORY_NEXT);
@@ -853,6 +969,11 @@ static int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, 
             break;
         default:
             if (linenoiseEditInsert(&l,c)) return -1;
+            if (search_save != NULL) {
+	            if (search_pos == -1)
+		            linenoiseEditHistorySearch(&l);
+	            refreshLine(&l);
+            }
             break;
         case CTRL_U: /* Ctrl+u, delete the whole line. */
             buf[0] = '\0';
@@ -979,10 +1100,18 @@ static void freeHistory(void) {
     }
 }
 
+/* Free the search buffer if exiting while searching */
+static void freeSearchBuf(void) {
+    if (search_save != NULL) {
+        free(search_save);
+    }
+}
+
 /* At exit we'll try to fix the terminal to the initial conditions. */
 static void linenoiseAtExit(void) {
     disableRawMode(STDIN_FILENO);
     freeHistory();
+    freeSearchBuf();
 }
 
 /* This is the API call to add a new entry in the linenoise history.
